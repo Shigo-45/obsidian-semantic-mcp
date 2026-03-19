@@ -14,6 +14,10 @@ dependencies = [
     "pydub>=0.25",
 ]
 
+[project.scripts]
+obsidian-mcp = "server:main"
+obsidian-mcp-ingest = "server:ingest_cli"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
