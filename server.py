@@ -61,6 +61,111 @@ def vault_index_status() -> str:
     return json.dumps(status, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+def vault_reindex(file_path: str | None = None) -> str:
+    """Re-index the vault or a specific file.
+
+    Args:
+        file_path: Optional path to a specific file. If None, re-indexes the entire vault.
+
+    Returns:
+        JSON string with indexing results
+    """
+    try:
+        if file_path:
+            fp = Path(file_path)
+            if not fp.is_file():
+                return json.dumps({"error": f"File not found: {file_path}"}, ensure_ascii=False)
+            indexed, errors = _ingest_single_file(fp)
+            if indexed > 0:
+                tracker.mark_indexed(fp)
+            return json.dumps({"file": file_path, "chunks_indexed": indexed, "errors": errors}, ensure_ascii=False)
+        else:
+            vault = VAULT_PATH
+            if not vault or not str(vault):
+                return json.dumps({"error": "VAULT_PATH is not set"}, ensure_ascii=False)
+            ingest_vault(vault)
+            status = index.get_status()
+            return json.dumps({"status": "complete", **status}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def vault_get_file(file_path: str) -> str:
+    """Retrieve the full content of a file from the vault.
+
+    For text files (.md, .canvas), returns the raw text content.
+    For binary files (pdf, image, audio, video), returns metadata about the file.
+
+    Args:
+        file_path: Path to the file in the vault
+
+    Returns:
+        File content or metadata as a string
+    """
+    fp = Path(file_path)
+    if not fp.is_file():
+        return json.dumps({"error": f"File not found: {file_path}"}, ensure_ascii=False)
+
+    ext = fp.suffix.lower()
+    if ext in _TEXT_EXTS:
+        try:
+            return fp.read_text(encoding="utf-8")
+        except Exception as exc:
+            return json.dumps({"error": f"Failed to read file: {exc}"}, ensure_ascii=False)
+    elif ext in _PDF_EXTS:
+        chunks = chunk_pdf(fp)
+        text = "\n\n---\n\n".join(c["text"] for c in chunks)
+        return text if text else json.dumps({"info": "No extractable text in PDF"}, ensure_ascii=False)
+    else:
+        stat = fp.stat()
+        return json.dumps({
+            "file_path": str(fp),
+            "file_type": ext,
+            "size_bytes": stat.st_size,
+            "modified": stat.st_mtime,
+            "info": "Binary file — content not directly readable. Use vault_semantic_search to find related content."
+        }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def vault_list_files(directory: str | None = None, file_type: str | None = None) -> str:
+    """List files in the vault with optional type filter.
+
+    Args:
+        directory: Optional subdirectory to list (relative to vault root)
+        file_type: Optional filter: "text", "pdf", "image", "audio", "video"
+
+    Returns:
+        JSON list of file paths
+    """
+    vault = VAULT_PATH
+    if not vault or not str(vault):
+        return json.dumps({"error": "VAULT_PATH is not set"}, ensure_ascii=False)
+
+    base = vault / directory if directory else vault
+    if not base.is_dir():
+        return json.dumps({"error": f"Directory not found: {base}"}, ensure_ascii=False)
+
+    if file_type and file_type in SUPPORTED_EXTENSIONS:
+        exts = SUPPORTED_EXTENSIONS[file_type]
+    else:
+        exts = _TEXT_EXTS | _PDF_EXTS | _AUDIO_EXTS | _IMAGE_EXTS | _VIDEO_EXTS
+
+    files = []
+    for fp in sorted(base.rglob("*")):
+        if not fp.is_file():
+            continue
+        if fp.suffix.lower() not in exts:
+            continue
+        if any(part.startswith(".") for part in fp.relative_to(vault).parts):
+            continue
+        files.append(str(fp.relative_to(vault)))
+
+    return json.dumps(files, ensure_ascii=False, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Ingestion helpers
 # ---------------------------------------------------------------------------
