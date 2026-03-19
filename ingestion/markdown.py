@@ -8,10 +8,14 @@ preserves UTF-8 / CJK text intact.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from pathlib import Path
 
 import frontmatter
+
+logger = logging.getLogger(__name__)
 
 # Heading pattern: lines that start with one to three '#' characters.
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)", re.MULTILINE)
@@ -24,7 +28,12 @@ def _format_frontmatter(metadata: dict) -> str:
     """Render a frontmatter dict back to a YAML-fenced string."""
     lines = ["---"]
     for key, value in metadata.items():
-        lines.append(f"{key}: {value!r}" if isinstance(value, (list, dict)) else f"{key}: {value}")
+        if isinstance(value, list):
+            lines.append(f"{key}: [{', '.join(str(v) for v in value)}]")
+        elif isinstance(value, dict):
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        else:
+            lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines)
 
@@ -42,8 +51,7 @@ def _split_by_paragraphs(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[s
 
     for para in paragraphs:
         para_len = len(para)
-        # +1 for the newline separator we would add between parts
-        join_overhead = 1 if current_parts else 0
+        join_overhead = 2 if current_parts else 0  # "\n\n" is 2 chars
         if current_parts and (current_len + join_overhead + para_len) > max_chars:
             chunks.append("\n\n".join(current_parts))
             current_parts = [para]
@@ -80,7 +88,11 @@ def chunk_markdown(file_path: str | Path) -> list[dict]:
        ~2000 characters are further split at paragraph boundaries.
     """
     file_path = Path(file_path)
-    post = frontmatter.load(str(file_path))
+    try:
+        post = frontmatter.load(str(file_path))
+    except Exception as e:
+        logger.warning("Failed to parse markdown file %s: %s", file_path, e)
+        return []
 
     fm_dict: dict = dict(post.metadata)
     body: str = post.content  # body text without the YAML front matter
