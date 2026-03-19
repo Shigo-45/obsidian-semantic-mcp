@@ -1,21 +1,27 @@
 """ChromaDB wrapper for persistent local vector storage."""
 
+import json
+
 import chromadb
 
 from config import CHROMA_PERSIST_DIR, EMBEDDING_DIM
 
-# Ensure the persistence directory exists
-CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+# Lazy-initialized ChromaDB client and collection
+_client = None
+_collection = None
 
-# Initialize persistent client
-_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
 
-# Get or create the vault collection using cosine similarity
-# No EmbeddingFunction — we provide pre-computed embeddings directly
-_collection = _client.get_or_create_collection(
-    name="vault",
-    metadata={"hnsw:space": "cosine"},
-)
+def _get_collection():
+    """Return the ChromaDB collection, initializing on first access."""
+    global _client, _collection
+    if _collection is None:
+        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        _client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+        _collection = _client.get_or_create_collection(
+            name="vault",
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _collection
 
 
 def upsert_chunk(
@@ -36,6 +42,11 @@ def upsert_chunk(
         file_type: One of the keys in SUPPORTED_EXTENSIONS («text», «pdf», etc.).
         extra_metadata: Optional additional key/value pairs merged into metadata.
     """
+    if len(embedding) != EMBEDDING_DIM:
+        raise ValueError(
+            f"Embedding dimension mismatch: got {len(embedding)}, expected {EMBEDDING_DIM}"
+        )
+
     metadata = {
         "file_path": file_path,
         "chunk_id": chunk_id,
@@ -44,7 +55,14 @@ def upsert_chunk(
     if extra_metadata:
         metadata.update(extra_metadata)
 
-    _collection.upsert(
+    # ChromaDB metadata values must be str, int, float, or bool
+    for key, value in metadata.items():
+        if isinstance(value, (list, dict)):
+            metadata[key] = json.dumps(value, ensure_ascii=False)
+        elif value is None:
+            metadata[key] = ""
+
+    _get_collection().upsert(
         ids=[chunk_id],
         embeddings=[embedding],
         documents=[chunk_text],
@@ -64,16 +82,16 @@ def query(embedding: list[float], n_results: int = 10) -> list[dict]:
             - ``file_path``: source file path
             - ``chunk_id``: chunk identifier
             - ``file_type``: type string
-            - ``score``: cosine distance (lower = more similar)
+            - ``score``: cosine similarity (0-1, higher = more similar)
             - ``snippet``: first 300 characters of chunk text
     """
-    total = _collection.count()
+    total = _get_collection().count()
     # Clamp n_results to the number of indexed chunks to avoid ChromaDB errors
     k = min(n_results, total) if total > 0 else 0
     if k == 0:
         return []
 
-    results = _collection.query(
+    results = _get_collection().query(
         query_embeddings=[embedding],
         n_results=k,
         include=["documents", "metadatas", "distances"],
@@ -91,7 +109,7 @@ def query(embedding: list[float], n_results: int = 10) -> list[dict]:
                 "file_path": meta.get("file_path", ""),
                 "chunk_id": meta.get("chunk_id", doc_id),
                 "file_type": meta.get("file_type", ""),
-                "score": dist,
+                "score": round(1.0 - dist, 4),
                 "snippet": doc_text[:300] if doc_text else "",
             }
         )
@@ -108,12 +126,13 @@ def get_status() -> dict:
             - ``by_file_type``: mapping of file_type -> chunk count
             - ``collection_name``: name of the ChromaDB collection
     """
-    total = _collection.count()
+    col = _get_collection()
+    total = col.count()
     by_file_type: dict[str, int] = {}
 
     if total > 0:
         # Fetch all metadatas to aggregate by file_type
-        all_meta = _collection.get(include=["metadatas"])["metadatas"]
+        all_meta = col.get(include=["metadatas"])["metadatas"]
         for meta in all_meta:
             ft = meta.get("file_type", "unknown")
             by_file_type[ft] = by_file_type.get(ft, 0) + 1
@@ -121,7 +140,7 @@ def get_status() -> dict:
     return {
         "total_chunks": total,
         "by_file_type": by_file_type,
-        "collection_name": _collection.name,
+        "collection_name": col.name,
     }
 
 
@@ -134,13 +153,13 @@ def delete_chunks_for_file(file_path: str) -> None:
     Args:
         file_path: The file path stored in chunk metadata.
     """
-    results = _collection.get(
+    results = _get_collection().get(
         where={"file_path": file_path},
         include=[],  # only need IDs
     )
     ids_to_delete = results.get("ids", [])
     if ids_to_delete:
-        _collection.delete(ids=ids_to_delete)
+        _get_collection().delete(ids=ids_to_delete)
 
 
 def get_indexed_files() -> list[str]:
@@ -149,10 +168,11 @@ def get_indexed_files() -> list[str]:
     Returns:
         Sorted list of unique file path strings.
     """
-    total = _collection.count()
+    col = _get_collection()
+    total = col.count()
     if total == 0:
         return []
 
-    all_meta = _collection.get(include=["metadatas"])["metadatas"]
+    all_meta = col.get(include=["metadatas"])["metadatas"]
     paths = {meta.get("file_path", "") for meta in all_meta if meta.get("file_path")}
     return sorted(paths)
