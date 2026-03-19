@@ -30,12 +30,15 @@ mcp = FastMCP("obsidian-semantic")
 
 
 @mcp.tool()
-def vault_semantic_search(query: str, n_results: int = 10) -> str:
-    """Search the vault using semantic similarity.
+def vault_semantic_search(query: str, n_results: int = 10, file_type: str | None = None) -> str:
+    """Search the Obsidian vault by meaning. Returns ranked results with file paths,
+    relevance scores, and text snippets. Use this to find notes related to a topic
+    even if they don't contain the exact search terms.
 
     Args:
         query: Natural language search query
         n_results: Number of results to return (default 10)
+        file_type: Optional filter — "text" (md/canvas), "pdf", "image", "audio", "video"
 
     Returns:
         JSON string with search results including file paths, scores, and snippets
@@ -43,7 +46,7 @@ def vault_semantic_search(query: str, n_results: int = 10) -> str:
     n_results = min(n_results, 50)  # cap results
     try:
         embedding = embed_text(query, task_type="RETRIEVAL_QUERY")
-        results = index.query(embedding, n_results=n_results)
+        results = index.query(embedding, n_results=n_results, file_type=file_type)
         return json.dumps(results, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
@@ -292,6 +295,7 @@ def _ingest_single_file(file_path: Path) -> tuple[int, int]:
 def ingest_file(file_path: Path) -> None:
     """Index a single file and print a summary."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     file_path = file_path.resolve()
     if not file_path.is_file():
         print(f"Error: File not found: {file_path}")
@@ -302,16 +306,30 @@ def ingest_file(file_path: Path) -> None:
     print(f"Done — {indexed} chunks indexed, {errs} errors.")
 
 
-def ingest_vault(vault_path: Path | None = None) -> None:
-    """Walk the vault and index all supported files."""
+def ingest_vault(vault_path: Path | None = None, *, mode: str = "full") -> None:
+    """Walk the vault and index all supported files.
+
+    Args:
+        vault_path: Override vault path.
+        mode: "md-only" (only .md), "text-only" (.md + .pdf), "full" (all types).
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     vault = (vault_path or VAULT_PATH)
     if not vault or not str(vault):
         print("Error: VAULT_PATH is not set. Export VAULT_PATH or pass --vault")
         sys.exit(1)
     vault = vault.resolve()
 
-    all_exts = _TEXT_EXTS | _PDF_EXTS | _AUDIO_EXTS | _IMAGE_EXTS | _VIDEO_EXTS
+    if mode == "md-only":
+        all_exts = frozenset([".md"])
+        print("Mode: md-only (markdown files only)")
+    elif mode == "text-only":
+        all_exts = frozenset([".md", ".canvas", ".pdf"])
+        print("Mode: text-only (markdown, canvas, and PDF files)")
+    else:
+        all_exts = _TEXT_EXTS | _PDF_EXTS | _AUDIO_EXTS | _IMAGE_EXTS | _VIDEO_EXTS
+        print("Mode: full (all supported file types)")
     total_files = 0
     total_chunks = 0
     total_errors = 0
@@ -363,6 +381,7 @@ def main():
 def ingest_cli():
     """CLI entry point for vault ingestion."""
     import argparse
+    import shutil
 
     parser = argparse.ArgumentParser(
         description="Index Obsidian vault for semantic search",
@@ -372,6 +391,21 @@ def ingest_cli():
     )
     parser.add_argument(
         "--file", type=str, default=None, help="Index a single file instead of full vault"
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--md-only", action="store_true", help="Only index markdown (.md) files"
+    )
+    mode_group.add_argument(
+        "--text-only", action="store_true", help="Only index text-based files (.md, .canvas, .pdf)"
+    )
+    mode_group.add_argument(
+        "--full", action="store_true", default=True, help="Index all supported file types (default)"
+    )
+    parser.add_argument(
+        "--force-rebuild", action="store_true",
+        help="Completely re-index from scratch. Backs up existing DB first; "
+             "old DB is only deleted after successful rebuild."
     )
     args = parser.parse_args()
 
@@ -385,8 +419,74 @@ def ingest_cli():
 
     if args.file:
         ingest_file(Path(args.file))
+        return
+
+    # Determine mode
+    mode = "full"
+    if args.md_only:
+        mode = "md-only"
+    elif args.text_only:
+        mode = "text-only"
+
+    # Force rebuild: backup existing DB, clear index + tracker, then ingest
+    if args.force_rebuild:
+        from config import CHROMA_PERSIST_DIR
+        backup_dir = None
+        tracker_db = CHROMA_PERSIST_DIR.parent / "file_tracker.db"
+
+        # Backup ChromaDB
+        if CHROMA_PERSIST_DIR.exists():
+            backup_dir = CHROMA_PERSIST_DIR.parent / "chroma.backup"
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            shutil.copytree(CHROMA_PERSIST_DIR, backup_dir)
+            print(f"Backed up ChromaDB to {backup_dir}")
+
+        # Backup tracker DB
+        tracker_backup = None
+        if tracker_db.exists():
+            tracker_backup = tracker_db.with_suffix(".db.backup")
+            shutil.copy2(tracker_db, tracker_backup)
+            print(f"Backed up tracker DB to {tracker_backup}")
+
+        # Clear existing data
+        try:
+            if CHROMA_PERSIST_DIR.exists():
+                shutil.rmtree(CHROMA_PERSIST_DIR)
+            if tracker_db.exists():
+                tracker_db.unlink()
+            # Reset lazy-init so new collection is created
+            import index as _idx
+            _idx._client = None
+            _idx._collection = None
+            import tracker as _trk
+            _trk._conn = None
+
+            print("Cleared existing index. Starting fresh rebuild...")
+            ingest_vault(vault, mode=mode)
+
+            # Success — remove backups
+            if backup_dir and backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            if tracker_backup and tracker_backup.exists():
+                tracker_backup.unlink()
+            print("Rebuild successful. Backups removed.")
+        except Exception as exc:
+            # Restore from backup on failure
+            print(f"\nRebuild FAILED: {exc}")
+            if backup_dir and backup_dir.exists():
+                if CHROMA_PERSIST_DIR.exists():
+                    shutil.rmtree(CHROMA_PERSIST_DIR)
+                shutil.copytree(backup_dir, CHROMA_PERSIST_DIR)
+                shutil.rmtree(backup_dir)
+                print("Restored ChromaDB from backup.")
+            if tracker_backup and tracker_backup.exists():
+                shutil.copy2(tracker_backup, tracker_db)
+                tracker_backup.unlink()
+                print("Restored tracker DB from backup.")
+            sys.exit(1)
     else:
-        ingest_vault(vault)
+        ingest_vault(vault, mode=mode)
 
 
 if __name__ == "__main__":

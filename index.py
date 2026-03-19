@@ -70,12 +70,14 @@ def upsert_chunk(
     )
 
 
-def query(embedding: list[float], n_results: int = 10) -> list[dict]:
+def query(embedding: list[float], n_results: int = 10, file_type: str | None = None) -> list[dict]:
     """Return the top-k most similar chunks.
 
     Args:
         embedding: Query embedding vector.
         n_results: Number of results to return.
+        file_type: Optional filter — only return chunks of this type
+                   (e.g. "text", "pdf", "image", "audio", "video").
 
     Returns:
         List of dicts, each containing:
@@ -91,11 +93,15 @@ def query(embedding: list[float], n_results: int = 10) -> list[dict]:
     if k == 0:
         return []
 
-    results = _get_collection().query(
-        query_embeddings=[embedding],
-        n_results=k,
-        include=["documents", "metadatas", "distances"],
-    )
+    query_kwargs: dict = {
+        "query_embeddings": [embedding],
+        "n_results": k,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if file_type:
+        query_kwargs["where"] = {"file_type": file_type}
+
+    results = _get_collection().query(**query_kwargs)
 
     output = []
     ids = results["ids"][0]

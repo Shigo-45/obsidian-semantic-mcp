@@ -2,11 +2,26 @@
 import os
 from pathlib import Path
 
-# Vault settings
-VAULT_PATH = Path(os.environ.get("VAULT_PATH", ""))
+# Load .env file if present (same directory as this file)
+_env_path = Path(__file__).parent / ".env"
+if _env_path.is_file():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        # Strip surrounding quotes
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        if value and key not in os.environ:  # don't override existing env vars
+            os.environ[key] = value
+
+# Vault settings — expand ~ in paths
+VAULT_PATH = Path(os.environ.get("VAULT_PATH", "")).expanduser()
 
 # ChromaDB persistence
-CHROMA_PERSIST_DIR = Path(os.environ.get("CHROMA_PERSIST_DIR", Path.home() / ".obsidian-mcp" / "chroma"))
+CHROMA_PERSIST_DIR = Path(os.environ.get("CHROMA_PERSIST_DIR", str(Path.home() / ".obsidian-mcp" / "chroma"))).expanduser()
 
 # Gemini API
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
