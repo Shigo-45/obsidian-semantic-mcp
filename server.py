@@ -10,10 +10,13 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 import index
+import tracker
 from config import SUPPORTED_EXTENSIONS, VAULT_PATH
-from embedder import embed_text
+from embedder import embed_audio, embed_image, embed_text
+from ingestion.audio import chunk_audio
 from ingestion.markdown import chunk_markdown
 from ingestion.pdf import chunk_pdf
+from ingestion.video import chunk_video
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,7 @@ def vault_index_status() -> str:
 # Build a flat set of extensions handled in Phase 1
 _TEXT_EXTS = SUPPORTED_EXTENSIONS["text"]
 _PDF_EXTS = SUPPORTED_EXTENSIONS["pdf"]
+_AUDIO_EXTS = SUPPORTED_EXTENSIONS["audio"]
 
 
 def _ingest_single_file(file_path: Path) -> tuple[int, int]:
@@ -72,6 +76,29 @@ def _ingest_single_file(file_path: Path) -> tuple[int, int]:
     # Choose chunker
     if ext in _PDF_EXTS:
         chunks = chunk_pdf(file_path)
+    elif ext in _AUDIO_EXTS:
+        audio_chunks = chunk_audio(file_path)
+        if not audio_chunks:
+            return 0, 0
+        # Audio uses native embedding (bytes), not text embedding
+        index.delete_chunks_for_file(fp_str)
+        errors = 0
+        for ac in audio_chunks:
+            chunk_id = f"{fp_str}::chunk_{ac['metadata']['chunk_index']}"
+            try:
+                embedding = embed_audio(ac["bytes"], ac["mime_type"])
+                index.upsert_chunk(
+                    file_path=fp_str,
+                    chunk_id=chunk_id,
+                    embedding=embedding,
+                    chunk_text="",
+                    file_type=ac["metadata"]["file_type"],
+                    extra_metadata=ac["metadata"],
+                )
+            except Exception:
+                logger.exception("Failed to embed/upsert audio chunk %s", chunk_id)
+                errors += 1
+        return len(audio_chunks) - errors, errors
     elif ext in _TEXT_EXTS:
         if ext == ".canvas":
             logger.info("Skipping .canvas (Phase 2): %s", fp_str)
@@ -128,7 +155,7 @@ def ingest_vault(vault_path: Path | None = None) -> None:
         sys.exit(1)
     vault = vault.resolve()
 
-    all_exts = _TEXT_EXTS | _PDF_EXTS
+    all_exts = _TEXT_EXTS | _PDF_EXTS | _AUDIO_EXTS
     total_files = 0
     total_chunks = 0
     total_errors = 0
