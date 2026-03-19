@@ -35,9 +35,13 @@ def vault_semantic_search(query: str, n_results: int = 10) -> str:
     Returns:
         JSON string with search results including file paths, scores, and snippets
     """
-    embedding = embed_text(query, task_type="RETRIEVAL_QUERY")
-    results = index.query(embedding, n_results=n_results)
-    return json.dumps(results, ensure_ascii=False, indent=2)
+    n_results = min(n_results, 50)  # cap results
+    try:
+        embedding = embed_text(query, task_type="RETRIEVAL_QUERY")
+        results = index.query(embedding, n_results=n_results)
+        return json.dumps(results, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -118,25 +122,35 @@ def ingest_file(file_path: Path) -> None:
 def ingest_vault(vault_path: Path | None = None) -> None:
     """Walk the vault and index all supported files."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    vault = (vault_path or VAULT_PATH).resolve()
+    vault = (vault_path or VAULT_PATH)
+    if not vault or not str(vault):
+        print("Error: VAULT_PATH is not set. Export VAULT_PATH or pass --vault")
+        sys.exit(1)
+    vault = vault.resolve()
 
     all_exts = _TEXT_EXTS | _PDF_EXTS
     total_files = 0
     total_chunks = 0
     total_errors = 0
 
+    # Collect eligible files first so we can show progress
+    eligible: list[Path] = []
     for fp in sorted(vault.rglob("*")):
         if not fp.is_file():
             continue
         if fp.suffix.lower() not in all_exts:
             continue
-        # Skip hidden directories (e.g. .obsidian, .git)
         if any(part.startswith(".") for part in fp.relative_to(vault).parts):
             continue
+        eligible.append(fp)
 
+    total_eligible = len(eligible)
+    print(f"Found {total_eligible} files to index.")
+
+    for fp in eligible:
         total_files += 1
-        logger.info("[%d] %s", total_files, fp.relative_to(vault))
         indexed, errs = _ingest_single_file(fp)
+        print(f"  [{total_files}/{total_eligible}] {fp.relative_to(vault)} ({indexed} chunks)")
         total_chunks += indexed
         total_errors += errs
 
@@ -172,7 +186,10 @@ def ingest_cli():
     args = parser.parse_args()
 
     vault = Path(args.vault) if args.vault else VAULT_PATH
-    if not vault or not vault.exists():
+    if not vault or not str(vault):
+        print("Error: VAULT_PATH is not set. Export VAULT_PATH or pass --vault")
+        sys.exit(1)
+    if not vault.exists():
         print(f"Error: Vault path does not exist: {vault}")
         sys.exit(1)
 
