@@ -7,14 +7,22 @@ from google.genai import types
 
 from config import GEMINI_API_KEY, GEMINI_MODEL, EMBEDDING_DIM, RATE_LIMIT_DELAY
 
-if not GEMINI_API_KEY:
-    raise EnvironmentError(
-        "GEMINI_API_KEY is not set. "
-        "Export the environment variable before running: "
-        "export GEMINI_API_KEY='your-api-key'"
-    )
+_client = None
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+
+def _get_client():
+    """Lazy-initialize the Gemini client on first use."""
+    global _client
+    if _client is None:
+        if not GEMINI_API_KEY:
+            raise EnvironmentError(
+                "GEMINI_API_KEY is not set. "
+                "Export the environment variable before running: "
+                "export GEMINI_API_KEY='your-api-key'"
+            )
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
+
 
 # Rate limiter state
 _last_call_time: float = 0.0
@@ -22,7 +30,12 @@ _lock = threading.Lock()
 
 
 def _rate_limit() -> None:
-    """Enforce at least RATE_LIMIT_DELAY seconds between API calls."""
+    """Enforce at least RATE_LIMIT_DELAY seconds between API calls.
+
+    Quota slot is consumed before the API call returns. This is intentional —
+    it prevents burst requests even when calls fail, protecting the rate limit
+    budget.
+    """
     global _last_call_time
     with _lock:
         now = time.time()
@@ -48,7 +61,7 @@ def embed_text(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
     """
     _rate_limit()
     try:
-        result = client.models.embed_content(
+        result = _get_client().models.embed_content(
             model=GEMINI_MODEL,
             contents=text,
             config=types.EmbedContentConfig(
@@ -78,7 +91,7 @@ def embed_image(image_bytes: bytes, mime_type: str) -> list[float]:
     """
     _rate_limit()
     try:
-        result = client.models.embed_content(
+        result = _get_client().models.embed_content(
             model=GEMINI_MODEL,
             contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
             config=types.EmbedContentConfig(
@@ -110,7 +123,7 @@ def embed_audio(audio_bytes: bytes, mime_type: str) -> list[float]:
     """
     _rate_limit()
     try:
-        result = client.models.embed_content(
+        result = _get_client().models.embed_content(
             model=GEMINI_MODEL,
             contents=[types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)],
             config=types.EmbedContentConfig(
