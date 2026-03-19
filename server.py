@@ -14,6 +14,8 @@ import tracker
 from config import SUPPORTED_EXTENSIONS, VAULT_PATH
 from embedder import embed_audio, embed_image, embed_text
 from ingestion.audio import chunk_audio
+from ingestion.canvas import chunk_canvas
+from ingestion.image import chunk_image
 from ingestion.markdown import chunk_markdown
 from ingestion.pdf import chunk_pdf
 from ingestion.video import chunk_video
@@ -55,6 +57,7 @@ def vault_index_status() -> str:
         JSON string with total chunks, counts by file type, and collection info
     """
     status = index.get_status()
+    status["tracker"] = tracker.get_stats()
     return json.dumps(status, ensure_ascii=False, indent=2)
 
 
@@ -66,6 +69,8 @@ def vault_index_status() -> str:
 _TEXT_EXTS = SUPPORTED_EXTENSIONS["text"]
 _PDF_EXTS = SUPPORTED_EXTENSIONS["pdf"]
 _AUDIO_EXTS = SUPPORTED_EXTENSIONS["audio"]
+_IMAGE_EXTS = SUPPORTED_EXTENSIONS["image"]
+_VIDEO_EXTS = SUPPORTED_EXTENSIONS["video"]
 
 
 def _ingest_single_file(file_path: Path) -> tuple[int, int]:
@@ -99,11 +104,57 @@ def _ingest_single_file(file_path: Path) -> tuple[int, int]:
                 logger.exception("Failed to embed/upsert audio chunk %s", chunk_id)
                 errors += 1
         return len(audio_chunks) - errors, errors
+    elif ext in _VIDEO_EXTS:
+        video_chunks = chunk_video(file_path)
+        if not video_chunks:
+            return 0, 0
+        # Video uses native embedding (bytes via embed_image — same Gemini API)
+        index.delete_chunks_for_file(fp_str)
+        errors = 0
+        for vc in video_chunks:
+            chunk_id = f"{fp_str}::chunk_{vc['metadata']['chunk_index']}"
+            try:
+                embedding = embed_image(vc["bytes"], vc["mime_type"])
+                index.upsert_chunk(
+                    file_path=fp_str,
+                    chunk_id=chunk_id,
+                    embedding=embedding,
+                    chunk_text="",
+                    file_type=vc["metadata"]["file_type"],
+                    extra_metadata=vc["metadata"],
+                )
+            except Exception:
+                logger.exception("Failed to embed/upsert video chunk %s", chunk_id)
+                errors += 1
+        return len(video_chunks) - errors, errors
     elif ext in _TEXT_EXTS:
         if ext == ".canvas":
-            logger.info("Skipping .canvas (Phase 2): %s", fp_str)
+            chunks = chunk_canvas(file_path)
+        else:
+            chunks = chunk_markdown(file_path)
+    elif ext in _IMAGE_EXTS:
+        image_chunks = chunk_image(file_path)
+        if not image_chunks:
             return 0, 0
-        chunks = chunk_markdown(file_path)
+        # Image uses native embedding (bytes), not text embedding
+        index.delete_chunks_for_file(fp_str)
+        errors = 0
+        for ic in image_chunks:
+            chunk_id = f"{fp_str}::chunk_{ic['metadata']['chunk_index']}"
+            try:
+                embedding = embed_image(ic["bytes"], ic["mime_type"])
+                index.upsert_chunk(
+                    file_path=fp_str,
+                    chunk_id=chunk_id,
+                    embedding=embedding,
+                    chunk_text="",
+                    file_type=ic["metadata"]["file_type"],
+                    extra_metadata=ic["metadata"],
+                )
+            except Exception:
+                logger.exception("Failed to embed/upsert image chunk %s", chunk_id)
+                errors += 1
+        return len(image_chunks) - errors, errors
     else:
         return 0, 0
 
@@ -155,7 +206,7 @@ def ingest_vault(vault_path: Path | None = None) -> None:
         sys.exit(1)
     vault = vault.resolve()
 
-    all_exts = _TEXT_EXTS | _PDF_EXTS | _AUDIO_EXTS
+    all_exts = _TEXT_EXTS | _PDF_EXTS | _AUDIO_EXTS | _IMAGE_EXTS | _VIDEO_EXTS
     total_files = 0
     total_chunks = 0
     total_errors = 0
@@ -174,15 +225,22 @@ def ingest_vault(vault_path: Path | None = None) -> None:
     total_eligible = len(eligible)
     print(f"Found {total_eligible} files to index.")
 
+    skipped = 0
     for fp in eligible:
         total_files += 1
+        if not tracker.needs_reindex(fp):
+            skipped += 1
+            continue
         indexed, errs = _ingest_single_file(fp)
+        if indexed > 0:
+            tracker.mark_indexed(fp)
         print(f"  [{total_files}/{total_eligible}] {fp.relative_to(vault)} ({indexed} chunks)")
         total_chunks += indexed
         total_errors += errs
 
     print(
         f"\nIngestion complete: {total_files} files processed, "
+        f"{skipped} skipped (unchanged), "
         f"{total_chunks} chunks indexed, {total_errors} errors."
     )
 
