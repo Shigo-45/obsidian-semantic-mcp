@@ -1,6 +1,7 @@
 """SQLite-based file modification time tracker for incremental re-indexing."""
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -10,16 +11,16 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = CHROMA_PERSIST_DIR.parent / "file_tracker.db"
 
-_conn = None
+# Thread-local storage so each thread gets its own SQLite connection
+_local = threading.local()
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Lazy-initialize the SQLite connection."""
-    global _conn
-    if _conn is None:
+    """Return a per-thread SQLite connection, initializing on first use."""
+    if not hasattr(_local, "conn") or _local.conn is None:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(str(DB_PATH))
-        _conn.execute(
+        _local.conn = sqlite3.connect(str(DB_PATH))
+        _local.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS file_mtime (
                 file_path TEXT PRIMARY KEY,
@@ -28,8 +29,8 @@ def _get_conn() -> sqlite3.Connection:
             )
         """
         )
-        _conn.commit()
-    return _conn
+        _local.conn.commit()
+    return _local.conn
 
 
 def needs_reindex(file_path: str | Path) -> bool:

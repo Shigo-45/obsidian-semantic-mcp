@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -12,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 import index
 import tracker
 from config import SUPPORTED_EXTENSIONS, VAULT_PATH
-from embedder import embed_audio, embed_image, embed_text
+from embedder import embed_audio, embed_image, embed_text, embed_texts
 from ingestion.audio import chunk_audio
 from ingestion.canvas import chunk_canvas
 from ingestion.image import chunk_image
@@ -29,30 +33,59 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("obsidian-semantic")
 
 
-@mcp.tool()
-def vault_semantic_search(query: str, n_results: int = 10, file_type: str | None = None) -> str:
+_VALID_FILE_TYPES = {"text", "pdf", "image", "audio", "video"}
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vault_semantic_search(
+    query: str,
+    n_results: int = 10,
+    file_type: str | None = None,
+    snippet_length: int = 300,
+) -> str:
     """Search the Obsidian vault by meaning. Returns ranked results with file paths,
     relevance scores, and text snippets. Use this to find notes related to a topic
     even if they don't contain the exact search terms.
 
     Args:
         query: Natural language search query
-        n_results: Number of results to return (default 10)
+        n_results: Number of results to return (default 10, max 50)
         file_type: Optional filter — "text" (md/canvas), "pdf", "image", "audio", "video"
+        snippet_length: Characters to return per snippet (default 300, max 2000)
 
     Returns:
         JSON string with search results including file paths, scores, and snippets
     """
-    n_results = min(n_results, 50)  # cap results
+    if file_type is not None and file_type not in _VALID_FILE_TYPES:
+        return json.dumps(
+            {"error": f"Invalid file_type '{file_type}'. Must be one of: {sorted(_VALID_FILE_TYPES)}"},
+            ensure_ascii=False,
+        )
+    n_results = min(max(1, n_results), 50)
+    snippet_length = min(max(50, snippet_length), 2000)
     try:
         embedding = embed_text(query, task_type="RETRIEVAL_QUERY")
-        results = index.query(embedding, n_results=n_results, file_type=file_type)
+        results = index.query(embedding, n_results=n_results, file_type=file_type, snippet_length=snippet_length)
         return json.dumps(results, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def vault_index_status() -> str:
     """Get the current status of the vault index.
 
@@ -64,52 +97,72 @@ def vault_index_status() -> str:
     return json.dumps(status, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
-def vault_reindex(file_path: str | None = None) -> str:
-    """Re-index the vault or a specific file.
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vault_reindex(file_path: str) -> str:
+    """Re-index a specific file in the vault. Embeds updated content and refreshes
+    its entry in the vector index.
+
+    To re-index the entire vault, run the CLI: uv run python server.py ingest --full
 
     Args:
-        file_path: Optional path to a specific file. If None, re-indexes the entire vault.
+        file_path: Absolute or vault-relative path to the file to re-index.
 
     Returns:
-        JSON string with indexing results
+        JSON string with chunks_indexed and errors counts
     """
     try:
-        if file_path:
-            fp = Path(file_path)
-            if not fp.is_file():
-                return json.dumps({"error": f"File not found: {file_path}"}, ensure_ascii=False)
-            indexed, errors = _ingest_single_file(fp)
-            if indexed > 0:
-                tracker.mark_indexed(fp)
-            return json.dumps({"file": file_path, "chunks_indexed": indexed, "errors": errors}, ensure_ascii=False)
-        else:
-            vault = VAULT_PATH
-            if not vault or not str(vault):
-                return json.dumps({"error": "VAULT_PATH is not set"}, ensure_ascii=False)
-            ingest_vault(vault)
-            status = index.get_status()
-            return json.dumps({"status": "complete", **status}, ensure_ascii=False)
+        fp = Path(file_path)
+        # Try resolving relative to vault root if not absolute
+        if not fp.is_file() and VAULT_PATH:
+            fp = VAULT_PATH / file_path
+        if not fp.is_file():
+            return json.dumps(
+                {"error": f"File not found: {file_path}. Provide an absolute path or a path relative to the vault root."},
+                ensure_ascii=False,
+            )
+        indexed, errors = _ingest_single_file(fp)
+        tracker.mark_indexed(fp)
+        return json.dumps({"file": str(fp), "chunks_indexed": indexed, "errors": errors}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def vault_get_file(file_path: str) -> str:
     """Retrieve the full content of a file from the vault.
 
     For text files (.md, .canvas), returns the raw text content.
-    For binary files (pdf, image, audio, video), returns metadata about the file.
+    For PDFs, returns extracted text separated by page breaks.
+    For binary files (image, audio, video), returns file metadata.
 
     Args:
-        file_path: Path to the file in the vault
+        file_path: Absolute or vault-relative path to the file
 
     Returns:
-        File content or metadata as a string
+        File content as text, or JSON metadata for binary files
     """
     fp = Path(file_path)
+    if not fp.is_file() and VAULT_PATH:
+        fp = VAULT_PATH / file_path
     if not fp.is_file():
-        return json.dumps({"error": f"File not found: {file_path}"}, ensure_ascii=False)
+        return json.dumps(
+            {"error": f"File not found: {file_path}. Provide an absolute path or a path relative to the vault root."},
+            ensure_ascii=False,
+        )
 
     ext = fp.suffix.lower()
     if ext in _TEXT_EXTS:
@@ -128,21 +181,41 @@ def vault_get_file(file_path: str) -> str:
             "file_type": ext,
             "size_bytes": stat.st_size,
             "modified": stat.st_mtime,
-            "info": "Binary file — content not directly readable. Use vault_semantic_search to find related content."
+            "info": "Binary file — content not directly readable. Use vault_semantic_search to find related content.",
         }, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
-def vault_list_files(directory: str | None = None, file_type: str | None = None) -> str:
-    """List files in the vault with optional type filter.
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vault_list_files(
+    directory: str | None = None,
+    file_type: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> str:
+    """List files in the vault with optional directory and type filters.
+    Results are paginated — use limit and offset to page through large directories.
 
     Args:
         directory: Optional subdirectory to list (relative to vault root)
         file_type: Optional filter: "text", "pdf", "image", "audio", "video"
+        limit: Maximum number of files to return (default 200, max 1000)
+        offset: Number of files to skip for pagination (default 0)
 
     Returns:
-        JSON list of file paths
+        JSON object with files list, total count, and pagination metadata
     """
+    if file_type is not None and file_type not in _VALID_FILE_TYPES:
+        return json.dumps(
+            {"error": f"Invalid file_type '{file_type}'. Must be one of: {sorted(_VALID_FILE_TYPES)}"},
+            ensure_ascii=False,
+        )
     vault = VAULT_PATH
     if not vault or not str(vault):
         return json.dumps({"error": "VAULT_PATH is not set"}, ensure_ascii=False)
@@ -166,7 +239,21 @@ def vault_list_files(directory: str | None = None, file_type: str | None = None)
             continue
         files.append(str(fp.relative_to(vault)))
 
-    return json.dumps(files, ensure_ascii=False, indent=2)
+    limit = min(max(1, limit), 1000)
+    total = len(files)
+    page = files[offset: offset + limit]
+    return json.dumps(
+        {
+            "files": page,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": (offset + limit) < total,
+            "next_offset": offset + limit if (offset + limit) < total else None,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,11 +359,17 @@ def _ingest_single_file(file_path: Path) -> tuple[int, int]:
     # Remove stale chunks before re-indexing
     index.delete_chunks_for_file(fp_str)
 
+    # Batch-embed all chunks in one API call
+    try:
+        embeddings = embed_texts([c["text"] for c in chunks])
+    except Exception:
+        logger.exception("Failed to batch-embed %d chunks for %s", len(chunks), fp_str)
+        return 0, len(chunks)
+
     errors = 0
-    for chunk in chunks:
+    for chunk, embedding in zip(chunks, embeddings):
         chunk_id = f"{fp_str}::chunk_{chunk['metadata']['chunk_index']}"
         try:
-            embedding = embed_text(chunk["text"])
             index.upsert_chunk(
                 file_path=fp_str,
                 chunk_id=chunk_id,
@@ -286,7 +379,7 @@ def _ingest_single_file(file_path: Path) -> tuple[int, int]:
                 extra_metadata=chunk["metadata"],
             )
         except Exception:
-            logger.exception("Failed to embed/upsert chunk %s", chunk_id)
+            logger.exception("Failed to upsert chunk %s", chunk_id)
             errors += 1
 
     return len(chunks) - errors, errors
@@ -346,25 +439,61 @@ def ingest_vault(vault_path: Path | None = None, *, mode: str = "full") -> None:
         eligible.append(fp)
 
     total_eligible = len(eligible)
-    print(f"Found {total_eligible} files to index.")
+    workers = int(os.environ.get("INGEST_WORKERS", "16"))
 
-    skipped = 0
-    for fp in eligible:
-        total_files += 1
-        if not tracker.needs_reindex(fp):
-            skipped += 1
-            continue
-        indexed, errs = _ingest_single_file(fp)
-        if indexed > 0:
-            tracker.mark_indexed(fp)
-        print(f"  [{total_files}/{total_eligible}] {fp.relative_to(vault)} ({indexed} chunks)")
-        total_chunks += indexed
-        total_errors += errs
-
+    # Split into needs-reindex vs skip upfront (needs_reindex is cheap/local)
+    to_index = [fp for fp in eligible if tracker.needs_reindex(fp)]
+    skipped = total_eligible - len(to_index)
     print(
-        f"\nIngestion complete: {total_files} files processed, "
+        f"Found {total_eligible} files: {len(to_index)} to index, "
+        f"{skipped} unchanged. Workers: {workers}",
+        flush=True,
+    )
+
+    start_time = time.monotonic()
+    done_count = 0
+    print_lock = threading.Lock()
+
+    def _worker(fp: Path) -> tuple[int, int]:
+        indexed, errs = _ingest_single_file(fp)
+        if errs == 0:
+            # Mark even 0-chunk files so they're skipped on future runs
+            # (e.g. image-only PDFs, empty files) — only skip if no errors
+            tracker.mark_indexed(fp)
+        return indexed, errs
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_worker, fp): fp for fp in to_index}
+        for fut in as_completed(futures):
+            fp = futures[fut]
+            try:
+                indexed, errs = fut.result()
+            except Exception:
+                logger.exception("Worker failed for %s", fp)
+                indexed, errs = 0, 1
+            with print_lock:
+                done_count += 1
+                total_chunks += indexed
+                total_errors += errs
+                elapsed = time.monotonic() - start_time
+                rate = done_count / elapsed if elapsed > 0 else 0
+                remaining = len(to_index) - done_count
+                eta = remaining / rate if rate > 0 else float("inf")
+                eta_str = f"{eta/60:.1f}min" if eta != float("inf") else "?"
+                print(
+                    f"  [{done_count}/{len(to_index)}] {fp.relative_to(vault)} "
+                    f"({indexed} chunks) | {rate:.1f} files/s | ETA {eta_str}",
+                    flush=True,
+                )
+
+    elapsed_total = time.monotonic() - start_time
+    print(
+        f"\nIngestion complete in {elapsed_total/60:.1f}min: "
+        f"{total_eligible} files scanned, "
         f"{skipped} skipped (unchanged), "
-        f"{total_chunks} chunks indexed, {total_errors} errors."
+        f"{done_count} indexed, "
+        f"{total_chunks} chunks, {total_errors} errors.",
+        flush=True,
     )
 
 

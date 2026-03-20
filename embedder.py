@@ -5,75 +5,90 @@ import threading
 from google import genai
 from google.genai import types
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, EMBEDDING_DIM, RATE_LIMIT_DELAY
+from config import GEMINI_API_KEY, GEMINI_MODEL, EMBEDDING_DIM
 
 _client = None
+_client_lock = threading.Lock()
 
 
 def _get_client():
-    """Lazy-initialize the Gemini client on first use."""
+    """Lazy-initialize the Gemini client on first use (thread-safe)."""
     global _client
     if _client is None:
-        if not GEMINI_API_KEY:
-            raise EnvironmentError(
-                "GEMINI_API_KEY is not set. "
-                "Export the environment variable before running: "
-                "export GEMINI_API_KEY='your-api-key'"
-            )
-        _client = genai.Client(api_key=GEMINI_API_KEY)
+        with _client_lock:
+            if _client is None:
+                if not GEMINI_API_KEY:
+                    raise EnvironmentError(
+                        "GEMINI_API_KEY is not set. "
+                        "Export the environment variable before running: "
+                        "export GEMINI_API_KEY='your-api-key'"
+                    )
+                _client = genai.Client(api_key=GEMINI_API_KEY)
     return _client
 
 
-# Rate limiter state
-_last_call_time: float = 0.0
-_lock = threading.Lock()
+# Token-bucket rate limiter — allows bursting up to MAX_TOKENS then refills at
+# REFILL_RATE tokens/second.  Each embed_content call consumes 1 token.
+# Default: 2000 RPM ≈ 33 RPS (conservative headroom below the 3000 RPM hard limit).
+import os as _os
+
+_REFILL_RATE: float = float(_os.environ.get("EMBED_RPS", "33"))  # tokens per second
+_MAX_TOKENS: float = _REFILL_RATE  # burst up to 1 second's worth
+_tokens: float = _MAX_TOKENS
+_last_refill: float = time.monotonic()
+_bucket_lock = threading.Lock()
 
 
 def _rate_limit() -> None:
-    """Enforce at least RATE_LIMIT_DELAY seconds between API calls.
+    """Consume one token from the bucket, blocking until one is available."""
+    global _tokens, _last_refill
+    while True:
+        with _bucket_lock:
+            now = time.monotonic()
+            elapsed = now - _last_refill
+            _tokens = min(_MAX_TOKENS, _tokens + elapsed * _REFILL_RATE)
+            _last_refill = now
+            if _tokens >= 1.0:
+                _tokens -= 1.0
+                return
+            wait = (1.0 - _tokens) / _REFILL_RATE
+        time.sleep(wait)
 
-    Quota slot is consumed before the API call returns. This is intentional —
-    it prevents burst requests even when calls fail, protecting the rate limit
-    budget.
-    """
-    global _last_call_time
-    with _lock:
-        now = time.time()
-        elapsed = now - _last_call_time
-        if elapsed < RATE_LIMIT_DELAY:
-            time.sleep(RATE_LIMIT_DELAY - elapsed)
-        _last_call_time = time.time()
+
+_BATCH_SIZE = 100  # Gemini batchEmbedContents limit
 
 
 def embed_text(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
-    """Embed a text string using the Gemini Embedding API.
+    """Embed a single text string using the Gemini Embedding API."""
+    return embed_texts([text], task_type=task_type)[0]
 
-    Args:
-        text: The text to embed.
-        task_type: Gemini task type (e.g. "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY",
-                   "SEMANTIC_SIMILARITY", "CLASSIFICATION", "CLUSTERING").
 
-    Returns:
-        A list of floats representing the embedding vector.
+def embed_texts(
+    texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT"
+) -> list[list[float]]:
+    """Batch-embed a list of texts, splitting into _BATCH_SIZE chunks as needed.
 
-    Raises:
-        RuntimeError: If the API call fails or returns unexpected structure.
+    Returns one embedding vector per input text, in the same order.
     """
-    _rate_limit()
-    try:
-        result = _get_client().models.embed_content(
-            model=GEMINI_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=EMBEDDING_DIM,
-            ),
-        )
-        return list(result.embeddings[0].values)
-    except Exception as exc:
-        raise RuntimeError(
-            f"embed_text failed for text of length {len(text)}: {exc}"
-        ) from exc
+    results: list[list[float]] = []
+    for i in range(0, len(texts), _BATCH_SIZE):
+        batch = texts[i : i + _BATCH_SIZE]
+        _rate_limit()
+        try:
+            response = _get_client().models.embed_content(
+                model=GEMINI_MODEL,
+                contents=batch,
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=EMBEDDING_DIM,
+                ),
+            )
+            results.extend(list(emb.values) for emb in response.embeddings)
+        except Exception as exc:
+            raise RuntimeError(
+                f"embed_texts failed for batch of {len(batch)} texts: {exc}"
+            ) from exc
+    return results
 
 
 def embed_image(image_bytes: bytes, mime_type: str) -> list[float]:

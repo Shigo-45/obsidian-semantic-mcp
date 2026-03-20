@@ -1,8 +1,12 @@
 """Image ingestion for native Gemini multimodal embedding."""
+import io
 import logging
 from pathlib import Path
+
 from PIL import Image
-import io
+import pillow_heif
+
+pillow_heif.register_heif_opener()  # enables Image.open() for .heic/.heif
 
 logger = logging.getLogger(__name__)
 
@@ -11,8 +15,8 @@ MIME_MAP = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".heic": "image/heic",
+    ".webp": "image/jpeg",  # converted to JPEG before sending
+    ".heic": "image/jpeg",  # converted to JPEG before sending
 }
 
 
@@ -35,16 +39,28 @@ def chunk_image(file_path: str | Path) -> list[dict]:
         with open(file_path, "rb") as f:
             image_bytes = f.read()
 
-        # Normalize: if file is too large (>10MB), resize
-        if len(image_bytes) > 10 * 1024 * 1024:
-            img = Image.open(io.BytesIO(image_bytes))
-            img.thumbnail((2048, 2048))
+        # HEIC/WebP: convert to JPEG (Gemini rejects these formats)
+        if ext in (".heic", ".webp"):
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             buf = io.BytesIO()
-            fmt = "PNG" if ext == ".png" else "JPEG"
-            img.save(buf, format=fmt)
+            img.save(buf, format="JPEG", quality=90)
             image_bytes = buf.getvalue()
-            mime_type = "image/png" if ext == ".png" else "image/jpeg"
-            logger.info("Resized large image %s to fit 10MB limit", file_path)
+            mime_type = "image/jpeg"
+            logger.info("Converted %s to JPEG: %s", ext, file_path)
+
+        # Normalize: resize if file >10MB or either dimension >4096px
+        else:
+            img = Image.open(io.BytesIO(image_bytes))
+            too_large = len(image_bytes) > 10 * 1024 * 1024
+            too_wide = img.width > 4096 or img.height > 4096
+            if too_large or too_wide:
+                img.thumbnail((4096, 4096))
+                buf = io.BytesIO()
+                fmt = "PNG" if ext == ".png" else "JPEG"
+                img.save(buf, format=fmt)
+                image_bytes = buf.getvalue()
+                mime_type = "image/png" if ext == ".png" else "image/jpeg"
+                logger.info("Resized image %s (%dx%d)", file_path, img.width, img.height)
 
         return [{
             "bytes": image_bytes,

@@ -28,8 +28,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-embedding-2-preview"
 EMBEDDING_DIM = 1536  # MRL 1536-dim (half of 3072 max) — Must match model's MRL output; update both GEMINI_MODEL and EMBEDDING_DIM together if model name changes
 
-# Rate limiting (free tier: 100 RPM = ~1.67 RPS → 0.6s min between requests)
-RATE_LIMIT_DELAY = 0.6  # seconds between API calls
+# Rate limiting — paid tier allows higher throughput (2000 RPM)
+# Free tier: 0.6s (100 RPM), Paid tier: 0.05s (1200 RPM, conservative)
+RATE_LIMIT_DELAY = float(os.environ.get("RATE_LIMIT_DELAY", "0.05"))
 
 # Supported file types
 SUPPORTED_EXTENSIONS = {

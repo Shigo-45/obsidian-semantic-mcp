@@ -1,6 +1,7 @@
 """ChromaDB wrapper for persistent local vector storage."""
 
 import json
+import threading
 
 import chromadb
 
@@ -9,18 +10,24 @@ from config import CHROMA_PERSIST_DIR, EMBEDDING_DIM
 # Lazy-initialized ChromaDB client and collection
 _client = None
 _collection = None
+_init_lock = threading.Lock()
+# Serializes all write operations (upsert/delete) — ChromaDB's PersistentClient
+# uses a Rust-backed SQLite and is not safe for concurrent writes.
+_write_lock = threading.Lock()
 
 
 def _get_collection():
     """Return the ChromaDB collection, initializing on first access."""
     global _client, _collection
     if _collection is None:
-        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-        _client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-        _collection = _client.get_or_create_collection(
-            name="vault",
-            metadata={"hnsw:space": "cosine"},
-        )
+        with _init_lock:
+            if _collection is None:
+                CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+                _client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+                _collection = _client.get_or_create_collection(
+                    name="vault",
+                    metadata={"hnsw:space": "cosine"},
+                )
     return _collection
 
 
@@ -62,15 +69,16 @@ def upsert_chunk(
         elif value is None:
             metadata[key] = ""
 
-    _get_collection().upsert(
-        ids=[chunk_id],
-        embeddings=[embedding],
-        documents=[chunk_text],
-        metadatas=[metadata],
-    )
+    with _write_lock:
+        _get_collection().upsert(
+            ids=[chunk_id],
+            embeddings=[embedding],
+            documents=[chunk_text],
+            metadatas=[metadata],
+        )
 
 
-def query(embedding: list[float], n_results: int = 10, file_type: str | None = None) -> list[dict]:
+def query(embedding: list[float], n_results: int = 10, file_type: str | None = None, snippet_length: int = 300) -> list[dict]:
     """Return the top-k most similar chunks.
 
     Args:
@@ -116,7 +124,7 @@ def query(embedding: list[float], n_results: int = 10, file_type: str | None = N
                 "chunk_id": meta.get("chunk_id", doc_id),
                 "file_type": meta.get("file_type", ""),
                 "score": round(1.0 - dist, 4),
-                "snippet": doc_text[:300] if doc_text else "",
+                "snippet": doc_text[:snippet_length] if doc_text else "",
             }
         )
 
@@ -159,13 +167,14 @@ def delete_chunks_for_file(file_path: str) -> None:
     Args:
         file_path: The file path stored in chunk metadata.
     """
-    results = _get_collection().get(
-        where={"file_path": file_path},
-        include=[],  # only need IDs
-    )
-    ids_to_delete = results.get("ids", [])
-    if ids_to_delete:
-        _get_collection().delete(ids=ids_to_delete)
+    with _write_lock:
+        results = _get_collection().get(
+            where={"file_path": file_path},
+            include=[],  # only need IDs
+        )
+        ids_to_delete = results.get("ids", [])
+        if ids_to_delete:
+            _get_collection().delete(ids=ids_to_delete)
 
 
 def get_indexed_files() -> list[str]:
