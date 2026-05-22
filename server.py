@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 import index
 import tracker
 from config import SUPPORTED_EXTENSIONS, VAULT_PATH
-from embedder import embed_audio, embed_image, embed_text, embed_texts
+from embedder import diag_log_config_snapshot, embed_audio, embed_image, embed_text, embed_texts
 from ingestion.audio import chunk_audio
 from ingestion.canvas import chunk_canvas
 from ingestion.image import chunk_image
@@ -71,7 +71,7 @@ def vault_semantic_search(
     n_results = min(max(1, n_results), 50)
     snippet_length = min(max(50, snippet_length), 2000)
     try:
-        embedding = embed_text(query, task_type="RETRIEVAL_QUERY")
+        embedding = embed_text(query, task="query")
         results = index.query(embedding, n_results=n_results, file_type=file_type, snippet_length=snippet_length)
         return json.dumps(results, ensure_ascii=False, indent=2)
     except Exception as exc:
@@ -408,6 +408,7 @@ def ingest_vault(vault_path: Path | None = None, *, mode: str = "full") -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    diag_log_config_snapshot()
     vault = (vault_path or VAULT_PATH)
     if not vault or not str(vault):
         print("Error: VAULT_PATH is not set. Export VAULT_PATH or pass --vault")
@@ -439,7 +440,7 @@ def ingest_vault(vault_path: Path | None = None, *, mode: str = "full") -> None:
         eligible.append(fp)
 
     total_eligible = len(eligible)
-    workers = int(os.environ.get("INGEST_WORKERS", "16"))
+    workers = int(os.environ.get("INGEST_WORKERS", "2"))
 
     # Split into needs-reindex vs skip upfront (needs_reindex is cheap/local)
     to_index = [fp for fp in eligible if tracker.needs_reindex(fp)]
@@ -504,6 +505,7 @@ def ingest_vault(vault_path: Path | None = None, *, mode: str = "full") -> None:
 
 def main():
     """Run the MCP server (stdio transport)."""
+    diag_log_config_snapshot()
     mcp.run()
 
 
