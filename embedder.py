@@ -21,6 +21,7 @@ from config import (
     EMBED_DIAG_LOG_FILE,
     EMBED_MAX_RETRIES,
     EMBED_MIN_BATCH_SIZE,
+    EMBED_MIN_REQUEST_INTERVAL,
     EMBED_RETRY_BASE_DELAY,
     EMBED_RETRY_MAX_DELAY,
     EMBED_RPM,
@@ -116,6 +117,7 @@ def _call_with_cross_process_pacing(fn, n_embeddings: int, est_tokens: int = 0):
 
     _RATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
     interval = max(
+        EMBED_MIN_REQUEST_INTERVAL,
         _MIN_INTERVAL_PER_EMBEDDING * max(1, n_embeddings),
         _MIN_INTERVAL_PER_TOKEN * max(0, est_tokens),
     )

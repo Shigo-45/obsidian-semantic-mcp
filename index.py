@@ -131,6 +131,13 @@ def query(embedding: list[float], n_results: int = 10, file_type: str | None = N
     return output
 
 
+# Batch size for paginated metadata fetches — keeps each ChromaDB get() call well
+# under SQLite's SQLITE_MAX_VARIABLE_NUMBER (default 32,766 for ChromaDB's build).
+# Using limit/offset avoids the ``WHERE id IN (...)`` explosion that occurs when
+# calling get() without filters on large collections.
+_GET_BATCH_SIZE = 2000
+
+
 def get_status() -> dict:
     """Return index statistics.
 
@@ -145,11 +152,25 @@ def get_status() -> dict:
     by_file_type: dict[str, int] = {}
 
     if total > 0:
-        # Fetch all metadatas to aggregate by file_type
-        all_meta = col.get(include=["metadatas"])["metadatas"]
-        for meta in all_meta:
-            ft = meta.get("file_type", "unknown")
-            by_file_type[ft] = by_file_type.get(ft, 0) + 1
+        # Fetch metadatas in batches to avoid SQLite variable-limit errors on
+        # large collections.  Using limit/offset causes ChromaDB to emit
+        # ``LIMIT N OFFSET M`` instead of ``WHERE id IN (id1, id2, ...)``.
+        offset = 0
+        while True:
+            batch = col.get(
+                limit=_GET_BATCH_SIZE,
+                offset=offset,
+                include=["metadatas"],
+            )
+            metas = batch["metadatas"]
+            if not metas:
+                break
+            for meta in metas:
+                ft = meta.get("file_type", "unknown")
+                by_file_type[ft] = by_file_type.get(ft, 0) + 1
+            offset += len(metas)
+            if len(metas) < _GET_BATCH_SIZE:
+                break
 
     return {
         "total_chunks": total,
@@ -188,6 +209,23 @@ def get_indexed_files() -> list[str]:
     if total == 0:
         return []
 
-    all_meta = col.get(include=["metadatas"])["metadatas"]
-    paths = {meta.get("file_path", "") for meta in all_meta if meta.get("file_path")}
+    paths: set[str] = set()
+    offset = 0
+    while True:
+        batch = col.get(
+            limit=_GET_BATCH_SIZE,
+            offset=offset,
+            include=["metadatas"],
+        )
+        metas = batch["metadatas"]
+        if not metas:
+            break
+        for meta in metas:
+            fp = meta.get("file_path", "")
+            if fp:
+                paths.add(fp)
+        offset += len(metas)
+        if len(metas) < _GET_BATCH_SIZE:
+            break
+
     return sorted(paths)

@@ -55,9 +55,14 @@ EMBED_BACKOFF_BATCH_FACTOR = float(os.environ.get("EMBED_BACKOFF_BATCH_FACTOR", 
 EMBED_BACKOFF_RECOVERY_STEPS = int(os.environ.get("EMBED_BACKOFF_RECOVERY_STEPS", "5"))
 
 # Retry configuration — exponential backoff with jitter
-EMBED_MAX_RETRIES = int(os.environ.get("EMBED_MAX_RETRIES", "3"))
+EMBED_MAX_RETRIES = int(os.environ.get("EMBED_MAX_RETRIES", "6"))
 EMBED_RETRY_BASE_DELAY = float(os.environ.get("EMBED_RETRY_BASE_DELAY", "5"))
 EMBED_RETRY_MAX_DELAY = float(os.environ.get("EMBED_RETRY_MAX_DELAY", "120"))
+
+# Gemini also has opaque request/minute buckets such as
+# global_embed_content_requests_per_minute_per_base_model / online_prediction_requests_per_base_model.
+# Keep at least this many seconds between local Gemini embedding requests across MCP processes.
+EMBED_MIN_REQUEST_INTERVAL = float(os.environ.get("EMBED_MIN_REQUEST_INTERVAL", "2"))
 
 # Optional coarse token/byte budget. Text uses a ~4 chars/token estimate;
 # multimodal native embeddings use uploaded byte size as a conservative proxy.
