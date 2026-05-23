@@ -44,8 +44,7 @@ class TestRateLimiterEmbeddingCount(unittest.TestCase):
         t0 = time.monotonic()
         with patch("time.monotonic", side_effect=[t0, t0]):  # no wait
             self.emb._rate_limit(100)
-        # Cross-process pacing writes a shared state file instead of updating
-        # the process-local _last_request fallback.
+        self.assertAlmostEqual(self.emb._last_request, t0, places=1)
 
     def test_rate_limit_single_embedding(self):
         """Single embedding at 600 RPM needs 0.1s wait."""

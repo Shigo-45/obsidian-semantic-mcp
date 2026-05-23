@@ -3,10 +3,8 @@ import json
 import os
 import random
 import sys
-import tempfile
 import threading
 import time
-from pathlib import Path
 from datetime import datetime, timezone
 
 from google import genai
@@ -21,11 +19,9 @@ from config import (
     EMBED_DIAG_LOG_FILE,
     EMBED_MAX_RETRIES,
     EMBED_MIN_BATCH_SIZE,
-    EMBED_MIN_REQUEST_INTERVAL,
     EMBED_RETRY_BASE_DELAY,
     EMBED_RETRY_MAX_DELAY,
     EMBED_RPM,
-    EMBED_TPM,
     EMBEDDING_DIM,
     GEMINI_API_KEY,
     GEMINI_MODEL,
@@ -63,97 +59,6 @@ _MIN_INTERVAL_PER_EMBEDDING = 60.0 / max(EMBED_RPM, 0.001)
 _last_request: float = 0.0
 _rate_lock = threading.Lock()
 
-# Cross-process pacing state. Obsidian MCP servers, Zotero MCP, and nightly
-# workers can all share the same Gemini base-model quota. A per-process limiter
-# still bursts when several MCP processes run at once, so serialize the timestamp
-# through a small file lock keyed by model name.
-_RATE_STATE_DIR = Path(os.environ.get("EMBED_RATE_STATE_DIR", tempfile.gettempdir()))
-_RATE_STATE_PATH = _RATE_STATE_DIR / f"hermes-gemini-embed-{GEMINI_MODEL.replace('/', '_')}.state"
-_MIN_INTERVAL_PER_TOKEN = 60.0 / max(EMBED_TPM, 0.001)
-
-
-def _rate_limit_cross_process(n_embeddings: int) -> None:
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover - non-POSIX fallback
-        return _rate_limit_process_only(n_embeddings)
-
-    _RATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    interval = _MIN_INTERVAL_PER_EMBEDDING * max(1, n_embeddings)
-    with open(_RATE_STATE_PATH, "a+", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            fh.seek(0)
-            raw = fh.read().strip()
-            try:
-                last = float(raw) if raw else 0.0
-            except ValueError:
-                last = 0.0
-            now = time.monotonic()
-            wait = interval - (now - last)
-            if wait > 0:
-                time.sleep(wait)
-                now = time.monotonic()
-            fh.seek(0)
-            fh.truncate()
-            fh.write(str(now))
-            fh.flush()
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-
-
-def _call_with_cross_process_pacing(fn, n_embeddings: int, est_tokens: int = 0):
-    """Run one Gemini API call while holding the shared quota lock.
-
-    The server quota is enforced on overlapping in-flight requests too. Holding
-    the lock until the response returns prevents several local MCP processes from
-    starting many large multimodal embedding calls simultaneously.
-    """
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover - non-POSIX fallback
-        _rate_limit_process_only(n_embeddings)
-        return fn()
-
-    _RATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    interval = max(
-        EMBED_MIN_REQUEST_INTERVAL,
-        _MIN_INTERVAL_PER_EMBEDDING * max(1, n_embeddings),
-        _MIN_INTERVAL_PER_TOKEN * max(0, est_tokens),
-    )
-    with open(_RATE_STATE_PATH, "a+", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            fh.seek(0)
-            raw = fh.read().strip()
-            try:
-                last = float(raw) if raw else 0.0
-            except ValueError:
-                last = 0.0
-            now = time.monotonic()
-            wait = interval - (now - last)
-            if wait > 0:
-                time.sleep(wait)
-            result = fn()
-            fh.seek(0)
-            fh.truncate()
-            fh.write(str(time.monotonic()))
-            fh.flush()
-            return result
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-
-
-def _rate_limit_process_only(n_embeddings: int = 1) -> None:
-    """Process-local fallback for platforms without fcntl."""
-    global _last_request
-    with _rate_lock:
-        now = time.monotonic()
-        wait = (_MIN_INTERVAL_PER_EMBEDDING * max(1, n_embeddings)) - (now - _last_request)
-        if wait > 0:
-            time.sleep(wait)
-        _last_request = time.monotonic()
-
 # Adaptive state — guarded by _rate_lock
 _current_batch_size: int = EMBED_BATCH_SIZE
 _consecutive_429s: int = 0
@@ -161,13 +66,19 @@ _consecutive_successes: int = 0
 
 
 def _rate_limit(n_embeddings: int = 1) -> None:
-    """Serialize embed API calls across processes by *embedding count*.
+    """Serialize embed API calls, spacing by *embedding count* against EMBED_RPM.
 
-    Gemini embedding quota is shared per base model/project, so all local MCP
-    processes must share one pacing clock. EMBED_RPM means embeddings/minute,
-    not API calls/minute: a 100-text batch at EMBED_RPM=3000 waits ~2s.
+    A batch of 100 embeddings at EMBED_RPM=3000 waits 2s; a single image/audio
+    embedding at EMBED_RPM=3000 waits 0.02s.  This is the P1 fix from 429
+    diagnosis — the old code counted API calls, not embeddings.
     """
-    _rate_limit_cross_process(max(1, n_embeddings))
+    global _last_request
+    with _rate_lock:
+        now = time.monotonic()
+        wait = (_MIN_INTERVAL_PER_EMBEDDING * n_embeddings) - (now - _last_request)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request = time.monotonic()
 
 
 def _on_429() -> None:
@@ -214,7 +125,6 @@ def diag_log_config_snapshot() -> None:
                 "GEMINI_MODEL": GEMINI_MODEL,
                 "EMBEDDING_DIM": EMBEDDING_DIM,
                 "EMBED_RPM": EMBED_RPM,
-                "EMBED_TPM": EMBED_TPM,
                 "EMBED_BATCH_SIZE": EMBED_BATCH_SIZE,
                 "EMBED_MIN_BATCH_SIZE": EMBED_MIN_BATCH_SIZE,
                 "EMBED_BACKOFF_BATCH_FACTOR": EMBED_BACKOFF_BATCH_FACTOR,
@@ -352,7 +262,7 @@ def _call_with_retry(
     last_exc: Exception | None = None
     for attempt in range(EMBED_MAX_RETRIES + 1):
         try:
-            result = _call_with_cross_process_pacing(fn, batch_size, est_tokens)
+            result = fn()
             # Success — log, notify adaptive state, return
             _on_success()
             _diag_write(
@@ -469,6 +379,7 @@ def embed_texts(
     batch_size = _current_batch_size  # snapshot for this call
     for i in range(0, len(formatted), batch_size):
         batch = formatted[i : i + batch_size]
+        _rate_limit(len(batch))
         try:
             # Estimate token count: ~4 chars per token for English text,
             # plus prompt-prefix overhead.  Not exact — proportional indicator.
@@ -506,6 +417,7 @@ def embed_image(image_bytes: bytes, mime_type: str) -> list[float]:
     Raises:
         RuntimeError: If the API call fails or returns unexpected structure.
     """
+    _rate_limit(1)
     try:
         result = _call_with_retry(
             lambda: _get_client().models.embed_content(
@@ -542,6 +454,7 @@ def embed_audio(audio_bytes: bytes, mime_type: str) -> list[float]:
     Raises:
         RuntimeError: If the API call fails or returns unexpected structure.
     """
+    _rate_limit(1)
     try:
         result = _call_with_retry(
             lambda: _get_client().models.embed_content(
