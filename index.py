@@ -131,6 +131,13 @@ def query(embedding: list[float], n_results: int = 10, file_type: str | None = N
     return output
 
 
+# Batch size for paginated metadata fetches — keeps each ChromaDB get() call well
+# under SQLite's SQLITE_MAX_VARIABLE_NUMBER (default 32,766 for ChromaDB's build).
+# Using limit/offset avoids the ``WHERE id IN (...)`` explosion that occurs when
+# calling get() without filters on large collections.
+_GET_BATCH_SIZE = 2000
+
+
 def get_status() -> dict:
     """Return index statistics.
 
@@ -145,11 +152,25 @@ def get_status() -> dict:
     by_file_type: dict[str, int] = {}
 
     if total > 0:
-        # Fetch all metadatas to aggregate by file_type
-        all_meta = col.get(include=["metadatas"])["metadatas"]
-        for meta in all_meta:
-            ft = meta.get("file_type", "unknown")
-            by_file_type[ft] = by_file_type.get(ft, 0) + 1
+        # Fetch metadatas in batches to avoid SQLite variable-limit errors on
+        # large collections.  Using limit/offset causes ChromaDB to emit
+        # ``LIMIT N OFFSET M`` instead of ``WHERE id IN (id1, id2, ...)``.
+        offset = 0
+        while True:
+            batch = col.get(
+                limit=_GET_BATCH_SIZE,
+                offset=offset,
+                include=["metadatas"],
+            )
+            metas = batch["metadatas"]
+            if not metas:
+                break
+            for meta in metas:
+                ft = meta.get("file_type", "unknown")
+                by_file_type[ft] = by_file_type.get(ft, 0) + 1
+            offset += len(metas)
+            if len(metas) < _GET_BATCH_SIZE:
+                break
 
     return {
         "total_chunks": total,
@@ -188,6 +209,191 @@ def get_indexed_files() -> list[str]:
     if total == 0:
         return []
 
-    all_meta = col.get(include=["metadatas"])["metadatas"]
-    paths = {meta.get("file_path", "") for meta in all_meta if meta.get("file_path")}
+    paths: set[str] = set()
+    offset = 0
+    while True:
+        batch = col.get(
+            limit=_GET_BATCH_SIZE,
+            offset=offset,
+            include=["metadatas"],
+        )
+        metas = batch["metadatas"]
+        if not metas:
+            break
+        for meta in metas:
+            fp = meta.get("file_path", "")
+            if fp:
+                paths.add(fp)
+        offset += len(metas)
+        if len(metas) < _GET_BATCH_SIZE:
+            break
+
     return sorted(paths)
+
+
+# ---------------------------------------------------------------------------
+# Lexical / hybrid search helpers
+# ---------------------------------------------------------------------------
+
+
+def _case_variants(term: str) -> list[str]:
+    """Return the term plus case variants that might match stored text.
+
+    ChromaDB ``$contains`` is case-sensitive.  A query for ``mt-keima`` will
+    not match ``mt-Keima`` stored in a chunk.  We probe the original form plus
+    lowercased plus a few common capitalisations so the user doesn't have to
+    guess the exact capitalisation used in their notes.
+
+    Returns a de-duplicated list (original always first so the exact match
+    gets priority when present).
+    """
+    variants = [term]
+    lower = term.lower()
+    if lower not in variants:
+        variants.append(lower)
+    upper = term.upper()
+    if upper not in variants:
+        variants.append(upper)
+    title = term.title()
+    if title not in variants:
+        variants.append(title)
+    return variants
+
+
+def lexical_query(
+    terms: list[str],
+    n_results: int = 10,
+    file_type: str | None = None,
+    snippet_length: int = 300,
+) -> list[dict]:
+    """Search chunks by exact/substring term matching (no embeddings).
+
+    For each term, queries ChromaDB with ``where_document $contains``,
+    probing case variants to handle capitalisation differences (e.g.
+    ``mt-keima`` will match ``mt-Keima`` in stored text).
+
+    Results are scored by how many distinct query terms appear in each
+    chunk, then by match order within the term.  Chunks matching more
+    terms rank higher.
+
+    Args:
+        terms: List of search terms (whitespace-split query tokens).
+        n_results: Maximum results to return.
+        file_type: Optional filter by file type.
+        snippet_length: Characters per snippet.
+
+    Returns:
+        Same structure as :func:`query`.
+    """
+    if not terms:
+        return []
+
+    col = _get_collection()
+    total = col.count()
+    if total == 0:
+        return []
+
+    # Per-chunk-id → (best_score, doc_text, metadata, matched_terms)
+    hits: dict[str, tuple[float, str, dict, int]] = {}
+
+    for term_idx, term in enumerate(terms):
+        for variant in _case_variants(term):
+            try:
+                results = col.get(
+                    where_document={"$contains": variant},
+                    include=["documents", "metadatas"],
+                )
+            except Exception:
+                # Some ChromaDB versions reject unknown operators or other
+                # edge cases — skip this variant gracefully.
+                continue
+
+            ids = results.get("ids", [])
+            documents = results.get("documents", [])
+            metadatas = results.get("metadatas", [])
+
+            for doc_id, doc_text, meta in zip(ids, documents, metadatas):
+                if file_type and meta.get("file_type") != file_type:
+                    continue
+                # Score: earlier terms rank higher, first variant (exact) ranks
+                # higher.  Multiple matching terms accumulate.
+                term_score = 1.0 / (1.0 + term_idx)  # 1.0, 0.5, 0.33, ...
+                existing = hits.get(doc_id)
+                if existing is None:
+                    hits[doc_id] = (term_score, doc_text, meta, 1)
+                else:
+                    prev_score, prev_doc, prev_meta, prev_count = existing
+                    hits[doc_id] = (
+                        prev_score + term_score,
+                        prev_doc,
+                        prev_meta,
+                        prev_count + 1,
+                    )
+
+    if not hits:
+        return []
+
+    # Sort by (num_matched_terms DESC, accumulated_score DESC)
+    sorted_hits = sorted(
+        hits.items(),
+        key=lambda kv: (kv[1][3], kv[1][0]),
+        reverse=True,
+    )
+
+    output = []
+    for doc_id, (acc_score, doc_text, meta, match_count) in sorted_hits[:n_results]:
+        # Normalise score: base 0.80 + 0.05 per extra matched term, capped at 0.99
+        lexical_score = min(0.99, 0.80 + 0.05 * (match_count - 1))
+        output.append(
+            {
+                "file_path": meta.get("file_path", ""),
+                "chunk_id": meta.get("chunk_id", doc_id),
+                "file_type": meta.get("file_type", ""),
+                "score": round(lexical_score, 4),
+                "snippet": doc_text[:snippet_length] if doc_text else "",
+                "match_terms": match_count,
+            }
+        )
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Stop-word set — common English words that are too generic for lexical search.
+# ---------------------------------------------------------------------------
+_LEXICAL_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "through", "during",
+    "before", "after", "above", "below", "between", "under", "again",
+    "further", "then", "once", "here", "there", "when", "where", "why",
+    "how", "all", "both", "each", "few", "more", "most", "other", "some",
+    "such", "no", "not", "only", "own", "same", "so", "than", "too",
+    "very", "and", "but", "or", "nor", "if", "while", "about", "up",
+    "out", "it", "its", "this", "that", "these", "those", "just", "also",
+    "now", "well", "way", "even", "new", "want", "because", "any", "every",
+    "which", "what", "who", "whom", "whose",
+})
+
+
+def _extract_lexical_terms(query: str) -> list[str]:
+    """Extract search-worthy terms from a query string.
+
+    Splits on whitespace, drops single-character non-CJK words and
+    common English stop-words.  Preserves hyphenated terms (mt-Keima),
+    Chinese characters, and mixed-language tokens.
+    """
+    raw_terms = query.split()
+    terms: list[str] = []
+    for t in raw_terms:
+        t = t.strip().rstrip(".,;:!?")
+        if not t:
+            continue
+        # Keep any term that contains CJK characters
+        has_cjk = any("\u4e00" <= c <= "\u9fff" or "\u3040" <= c <= "\u30ff" for c in t)
+        if has_cjk:
+            terms.append(t)
+        elif len(t) >= 2 and t.lower() not in _LEXICAL_STOP_WORDS:
+            terms.append(t)
+    return terms
