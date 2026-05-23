@@ -293,8 +293,8 @@ def lexical_query(
     if total == 0:
         return []
 
-    # Per-chunk-id → (best_score, doc_text, metadata, matched_terms)
-    hits: dict[str, tuple[float, str, dict, int]] = {}
+    # Per-chunk-id → (accumulated_score, doc_text, metadata, set[term_idx])
+    hits: dict[str, tuple[float, str, dict, set[int]]] = {}
 
     for term_idx, term in enumerate(terms):
         for variant in _case_variants(term):
@@ -315,20 +315,22 @@ def lexical_query(
             for doc_id, doc_text, meta in zip(ids, documents, metadatas):
                 if file_type and meta.get("file_type") != file_type:
                     continue
-                # Score: earlier terms rank higher, first variant (exact) ranks
-                # higher.  Multiple matching terms accumulate.
+                # Score: earlier terms rank higher.  First variant that
+                # matches contributes the term score; subsequent variants
+                # of the same term do NOT inflate match_terms.
                 term_score = 1.0 / (1.0 + term_idx)  # 1.0, 0.5, 0.33, ...
                 existing = hits.get(doc_id)
                 if existing is None:
-                    hits[doc_id] = (term_score, doc_text, meta, 1)
-                else:
-                    prev_score, prev_doc, prev_meta, prev_count = existing
+                    hits[doc_id] = (term_score, doc_text, meta, {term_idx})
+                elif term_idx not in existing[3]:
+                    prev_score, prev_doc, prev_meta, prev_set = existing
                     hits[doc_id] = (
                         prev_score + term_score,
                         prev_doc,
                         prev_meta,
-                        prev_count + 1,
+                        prev_set | {term_idx},
                     )
+                # else: term_idx already matched via another variant — skip
 
     if not hits:
         return []
@@ -336,12 +338,13 @@ def lexical_query(
     # Sort by (num_matched_terms DESC, accumulated_score DESC)
     sorted_hits = sorted(
         hits.items(),
-        key=lambda kv: (kv[1][3], kv[1][0]),
+        key=lambda kv: (len(kv[1][3]), kv[1][0]),
         reverse=True,
     )
 
     output = []
-    for doc_id, (acc_score, doc_text, meta, match_count) in sorted_hits[:n_results]:
+    for doc_id, (acc_score, doc_text, meta, term_set) in sorted_hits[:n_results]:
+        match_count = len(term_set)
         # Normalise score: base 0.80 + 0.05 per extra matched term, capped at 0.99
         lexical_score = min(0.99, 0.80 + 0.05 * (match_count - 1))
         output.append(

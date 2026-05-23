@@ -6,3 +6,4 @@ __pycache__/
 dist/
 *.egg-info/
 .chroma/
+add_key.py

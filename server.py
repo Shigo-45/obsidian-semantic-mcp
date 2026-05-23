@@ -14,6 +14,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 import index
+from index import _extract_lexical_terms, lexical_query as _lexical_query
 import tracker
 from config import SUPPORTED_EXTENSIONS, VAULT_PATH
 from embedder import diag_log_config_snapshot, embed_audio, embed_image, embed_text, embed_texts
@@ -74,6 +75,137 @@ def vault_semantic_search(
         embedding = embed_text(query, task="query")
         results = index.query(embedding, n_results=n_results, file_type=file_type, snippet_length=snippet_length)
         return json.dumps(results, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vault_lexical_search(
+    query: str,
+    n_results: int = 10,
+    file_type: str | None = None,
+    snippet_length: int = 300,
+) -> str:
+    """Search the Obsidian vault by exact term and substring matching
+    (no semantic / embedding search).  Finds chunks whose text literally
+    contains the query terms — ideal for specialist vocabulary, gene names,
+    hyphenated terms (mt-Keima), and mixed Chinese/English queries where
+    embedding-based search alone might miss exact hits.
+
+    The search is case-insensitive: ``mt-keima`` will match ``mt-Keima``
+    in stored text.
+
+    Args:
+        query: Search terms (whitespace-separated).  Common English
+               stop-words are ignored; CJK characters are always kept.
+        n_results: Number of results to return (default 10, max 50).
+        file_type: Optional filter — \"text\" (md/canvas), \"pdf\", \"image\",
+                   \"audio\", \"video\".
+        snippet_length: Characters to return per snippet (default 300,
+                        max 2000).
+
+    Returns:
+        JSON string with search results including file paths, scores,
+        snippets, and ``match_terms`` (how many query terms were found
+        in each chunk).
+    """
+    if file_type is not None and file_type not in _VALID_FILE_TYPES:
+        return json.dumps(
+            {"error": f"Invalid file_type '{file_type}'. Must be one of: {sorted(_VALID_FILE_TYPES)}"},
+            ensure_ascii=False,
+        )
+    n_results = min(max(1, n_results), 50)
+    snippet_length = min(max(50, snippet_length), 2000)
+    try:
+        terms = _extract_lexical_terms(query)
+        results = _lexical_query(
+            terms, n_results=n_results, file_type=file_type, snippet_length=snippet_length,
+        )
+        return json.dumps(results, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vault_hybrid_search(
+    query: str,
+    n_results: int = 10,
+    file_type: str | None = None,
+    snippet_length: int = 300,
+) -> str:
+    """Combined semantic + lexical search.  Runs both embedding-based and
+    exact-term searches, then merges the results.  Lexical (exact) matches
+    are surfaced first; semantic matches fill the remaining slots with
+    deduplication.
+
+    Use this when you want the broad recall of semantic search but need to
+    guarantee that exact specialist terms (gene names, hyphenated compounds,
+    Chinese/English jargon) are not buried under semantically-adjacent but
+    irrelevant neighbors.
+
+    Args:
+        query: Natural language search query.
+        n_results: Number of results to return (default 10, max 50).
+        file_type: Optional filter — \"text\" (md/canvas), \"pdf\", \"image\",
+                   \"audio\", \"video\".
+        snippet_length: Characters to return per snippet (default 300,
+                        max 2000).
+
+    Returns:
+        JSON string with merged results: lexical matches first (score
+        0.80–0.99), then semantic matches (ChromaDB cosine scores,
+        0.0–1.0).  ``source`` field indicates \"lexical\" or \"semantic\".
+    """
+    if file_type is not None and file_type not in _VALID_FILE_TYPES:
+        return json.dumps(
+            {"error": f"Invalid file_type '{file_type}'. Must be one of: {sorted(_VALID_FILE_TYPES)}"},
+            ensure_ascii=False,
+        )
+    n_results = min(max(1, n_results), 50)
+    snippet_length = min(max(50, snippet_length), 2000)
+    try:
+        # Run semantic and lexical in sequence (lexical is local ChromaDB
+        # queries — fast enough to run sequentially).
+        embedding = embed_text(query, task="query")
+        semantic = index.query(
+            embedding, n_results=n_results * 3, file_type=file_type,
+            snippet_length=snippet_length,
+        )
+
+        terms = _extract_lexical_terms(query)
+        lexical = _lexical_query(
+            terms, n_results=n_results, file_type=file_type,
+            snippet_length=snippet_length,
+        ) if terms else []
+
+        # Merge: lexical first, then semantic (deduped by chunk_id).
+        seen: set[str] = set()
+        merged: list[dict] = []
+
+        for hit in lexical:
+            merged.append({**hit, "source": "lexical"})
+            seen.add(hit["chunk_id"])
+
+        for hit in semantic:
+            if hit["chunk_id"] not in seen:
+                merged.append({**hit, "source": "semantic"})
+                seen.add(hit["chunk_id"])
+
+        return json.dumps(merged[:n_results], ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
